@@ -7,152 +7,171 @@ import { generateSummary } from "../services/generateSummary";
 const router = Router();
 
 // Generate or retrieve summary
-router.post("/generate", async (req: AuthRequest, res) => {
-  try {
-    const userId = req.user!.id;
-    const { content, metadata } = req.body;
-
-    if (!content) {
-      return res.status(400).json({ error: "Content (transcript) is required" });
-    }
-
-    if (!metadata || !metadata.videoId) {
-      return res.status(400).json({ error: "Video metadata with videoId is required" });
-    }
-
-    const videoUrl = metadata.url || `https://www.youtube.com/watch?v=${metadata.videoId}`;
-
-    // Check for existing summary
-    let existingSummary;
+router.post(
+  "/generate",
+  authMiddleware,
+  async (req: AuthRequest, res: Response) => {
     try {
-      existingSummary = await prisma.summary.findFirst({
-        where: {
-          videoUrl,
-        },
-      });
+      const userId = req.user?.id;
+      if (!userId) {
+        return res
+          .status(401)
+          .json({ success: false, error: "User not authenticated" });
+      }
 
-      if (existingSummary) {
-        // Parse the stored summary into the expected format
-        let keyPoints: string[] = [];
-        let fullSummary = existingSummary.summary;
-        let title = metadata.title || "Video Summary";
+      const { content, metadata } = req.body;
 
-        // Try to extract key points and full summary from stored format
-        const storedSummary = existingSummary.summary;
-        const keyPointsMatch = storedSummary.match(/Key Points:([\s\S]*?)(?=\n\n|$)/i);
-        
-        if (keyPointsMatch) {
-          keyPoints = keyPointsMatch[1]
-            .split('-')
-            .map(point => point.trim())
-            .filter(point => point.length > 0);
-            
-          // Get the full summary part
-          const fullSummaryMatch = storedSummary.match(/(?:Key Points:[\s\S]*?\n\n)([\s\S]*?)$/);
-          if (fullSummaryMatch) {
-            fullSummary = fullSummaryMatch[1].trim();
+      if (!content) {
+        return res
+          .status(400)
+          .json({ error: "Content (transcript) is required" });
+      }
+
+      if (!metadata || !metadata.videoId) {
+        return res
+          .status(400)
+          .json({ error: "Video metadata with videoId is required" });
+      }
+
+      const videoUrl =
+        metadata.url || `https://www.youtube.com/watch?v=${metadata.videoId}`;
+
+      // Check for existing summary
+      let existingSummary;
+      try {
+        existingSummary = await prisma.summary.findFirst({
+          where: {
+            videoUrl,
+          },
+        });
+
+        if (existingSummary) {
+          // Parse the stored summary into the expected format
+          let keyPoints: string[] = [];
+          let fullSummary = existingSummary.summary;
+          let title = metadata.title || "Video Summary";
+
+          // Try to extract key points and full summary from stored format
+          const storedSummary = existingSummary.summary;
+          const keyPointsMatch = storedSummary.match(
+            /Key Points:([\s\S]*?)(?=\n\n|$)/i
+          );
+
+          if (keyPointsMatch) {
+            keyPoints = keyPointsMatch[1]
+              .split("-")
+              .map((point: string) => point.trim())
+              .filter((point: string) => point.length > 0);
+
+            // Get the full summary part
+            const fullSummaryMatch = storedSummary.match(
+              /(?:Key Points:[\s\S]*?\n\n)([\s\S]*?)$/
+            );
+            if (fullSummaryMatch) {
+              fullSummary = fullSummaryMatch[1].trim();
+            }
+
+            // Extract title if available from beginning of the summary
+            const titleMatch = storedSummary.match(/^(.*?)\n/);
+            if (titleMatch) {
+              title = titleMatch[1].trim();
+            }
           }
-          
-          // Extract title if available from beginning of the summary
-          const titleMatch = storedSummary.match(/^(.*?)\n/);
-          if (titleMatch) {
-            title = titleMatch[1].trim();
-          }
+
+          return res.json({
+            success: true,
+            data: {
+              title,
+              keyPoints,
+              fullSummary,
+            },
+          });
+        }
+      } catch (dbError) {
+        console.error("Database error checking for existing summary:", dbError);
+        // Continue with summary generation even if DB lookup fails
+      }
+
+      // Check user credits
+      let userCredits = 0;
+      try {
+        const user = await prisma.user.findUnique({
+          where: { id: userId },
+          select: { credits: true },
+        });
+
+        if (!user) {
+          return res.status(404).json({
+            success: false,
+            error: "User not found",
+          });
         }
 
-        return res.json({
-          success: true,
-          data: {
-            title,
-            keyPoints,
-            fullSummary
-          }
+        userCredits = user.credits;
+
+        if (userCredits < 1) {
+          return res.status(403).json({
+            success: false,
+            error: "Insufficient credits",
+          });
+        }
+      } catch (dbError) {
+        console.error("Database error checking user credits:", dbError);
+        // For now, we'll allow the operation to continue even if credit check fails
+      }
+
+      // Generate summary
+      const summary = await generateSummary(content, metadata);
+
+      if (!summary.fullSummary) {
+        return res.status(500).json({
+          success: false,
+          error: "Failed to generate summary",
         });
       }
-    } catch (dbError) {
-      console.error("Database error checking for existing summary:", dbError);
-      // Continue with summary generation even if DB lookup fails
-    }
 
-    // Check user credits
-    let userCredits = 0;
-    try {
-      const user = await prisma.user.findUnique({
-        where: { id: userId },
-        select: { credits: true },
+      // Format summary for storage
+      const summaryText = `${summary.title}\n\nKey Points:\n${summary.keyPoints
+        .map((point) => `- ${point}`)
+        .join("\n")}\n\n${summary.fullSummary}`;
+
+      // Save summary to database and update user credits
+      try {
+        await prisma.$transaction([
+          prisma.summary.create({
+            data: {
+              userId,
+              videoUrl,
+              summary: summaryText,
+              transcript: content,
+            },
+          }),
+          prisma.user.update({
+            where: { id: userId },
+            data: {
+              credits: { decrement: 1 },
+            },
+          }),
+        ]);
+      } catch (dbError) {
+        console.error("Database error saving summary:", dbError);
+        // Continue and return the summary even if saving fails
+      }
+
+      return res.json({
+        success: true,
+        data: summary,
+        creditsRemaining: Math.max(0, userCredits - 1),
       });
-
-      if (!user) {
-        return res.status(404).json({ 
-          success: false,
-          error: "User not found" 
-        });
-      }
-
-      userCredits = user.credits;
-
-      if (userCredits < 1) {
-        return res.status(403).json({ 
-          success: false,
-          error: "Insufficient credits" 
-        });
-      }
-    } catch (dbError) {
-      console.error("Database error checking user credits:", dbError);
-      // For now, we'll allow the operation to continue even if credit check fails
-    }
-
-    // Generate summary
-    const summary = await generateSummary(content, metadata);
-
-    if (!summary.fullSummary) {
-      return res.status(500).json({ 
+    } catch (error) {
+      console.error("Error generating summary:", error);
+      res.status(500).json({
         success: false,
-        error: "Failed to generate summary" 
+        error: "Failed to generate summary",
       });
     }
-
-    // Format summary for storage
-    const summaryText = `${summary.title}\n\nKey Points:\n${summary.keyPoints
-      .map((point) => `- ${point}`)
-      .join("\n")}\n\n${summary.fullSummary}`;
-
-    // Save summary to database and update user credits
-    try {
-      await prisma.$transaction([
-        prisma.summary.create({
-          data: {
-            userId,
-            videoUrl,
-            summary: summaryText,
-            transcript: content,
-          },
-        }),
-        prisma.user.update({
-          where: { id: userId },
-          data: {
-            credits: { decrement: 1 },
-          },
-        }),
-      ]);
-    } catch (dbError) {
-      console.error("Database error saving summary:", dbError);
-      // Continue and return the summary even if saving fails
-    }
-
-    return res.json({
-      success: true,
-      data: summary,
-      creditsRemaining: Math.max(0, userCredits - 1),
-    });
-  } catch (error) {
-    console.error("Error generating summary:", error);
-    res.status(500).json({ 
-      success: false,
-      error: "Failed to generate summary" 
-    });
   }
-});
+);
 
 // Get all summaries for a user
 router.get("/", authMiddleware, async (req: AuthRequest, res) => {
@@ -175,7 +194,7 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
     ]);
 
     // Format summaries for the frontend
-    const formattedSummaries = summaries.map(summary => {
+    const formattedSummaries = summaries.map((summary: any) => {
       // Try to extract title, key points, and full summary from the stored format
       let title = "";
       let keyPoints: string[] = [];
@@ -186,14 +205,18 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
         title = titleMatch[1].trim();
       }
 
-      const keyPointsMatch = summary.summary.match(/Key Points:([\s\S]*?)(?=\n\n|$)/i);
+      const keyPointsMatch = summary.summary.match(
+        /Key Points:([\s\S]*?)(?=\n\n|$)/i
+      );
       if (keyPointsMatch) {
         keyPoints = keyPointsMatch[1]
-          .split('-')
-          .map(point => point.trim())
-          .filter(point => point.length > 0);
-          
-        const fullSummaryMatch = summary.summary.match(/(?:Key Points:[\s\S]*?\n\n)([\s\S]*?)$/);
+          .split("-")
+          .map((point: string) => point.trim())
+          .filter((point: string) => point.length > 0);
+
+        const fullSummaryMatch = summary.summary.match(
+          /(?:Key Points:[\s\S]*?\n\n)([\s\S]*?)$/
+        );
         if (fullSummaryMatch) {
           fullSummary = fullSummaryMatch[1].trim();
         }
@@ -209,26 +232,26 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
       };
     });
 
-    res.json({ 
+    res.json({
       success: true,
       data: {
         summaries: formattedSummaries,
         total,
         page,
-        limit
-      }
+        limit,
+      },
     });
   } catch (error) {
     console.error("Error fetching summaries:", error);
-    res.status(500).json({ 
+    res.status(500).json({
       success: false,
-      error: "Failed to fetch summaries", 
+      error: "Failed to fetch summaries",
       data: {
         summaries: [],
         total: 0,
         page: 1,
-        limit: 10
-      }
+        limit: 10,
+      },
     });
   }
 });
@@ -241,16 +264,17 @@ router.post(
     const { videoId, title, keyPoints, fullSummary, sourceUrl } = req.body;
 
     if (!videoId || !title || !fullSummary) {
-      res.status(400).json({ 
+      res.status(400).json({
         success: false,
-        error: "Missing required fields" 
+        error: "Missing required fields",
       });
       return;
     }
 
     try {
-      const videoUrl = sourceUrl || `https://www.youtube.com/watch?v=${videoId}`;
-      
+      const videoUrl =
+        sourceUrl || `https://www.youtube.com/watch?v=${videoId}`;
+
       // Format the summary for storage
       const summaryText = `${title}\n\nKey Points:\n${keyPoints
         .map((point: string) => `- ${point}`)
@@ -267,13 +291,13 @@ router.post(
 
       res.json({
         success: true,
-        data: { id: newSummary.id }
+        data: { id: newSummary.id },
       });
     } catch (error) {
       console.error("Error saving summary:", error);
-      res.status(500).json({ 
+      res.status(500).json({
         success: false,
-        error: "Failed to create summary" 
+        error: "Failed to create summary",
       });
     }
   }
@@ -295,9 +319,9 @@ router.get(
       });
 
       if (!summary) {
-        res.status(404).json({ 
+        res.status(404).json({
           success: false,
-          error: "Summary not found" 
+          error: "Summary not found",
         });
         return;
       }
@@ -312,14 +336,18 @@ router.get(
         title = titleMatch[1].trim();
       }
 
-      const keyPointsMatch = summary.summary.match(/Key Points:([\s\S]*?)(?=\n\n|$)/i);
+      const keyPointsMatch = summary.summary.match(
+        /Key Points:([\s\S]*?)(?=\n\n|$)/i
+      );
       if (keyPointsMatch) {
         keyPoints = keyPointsMatch[1]
-          .split('-')
-          .map(point => point.trim())
-          .filter(point => point.length > 0);
-          
-        const fullSummaryMatch = summary.summary.match(/(?:Key Points:[\s\S]*?\n\n)([\s\S]*?)$/);
+          .split("-")
+          .map((point: string) => point.trim())
+          .filter((point: string) => point.length > 0);
+
+        const fullSummaryMatch = summary.summary.match(
+          /(?:Key Points:[\s\S]*?\n\n)([\s\S]*?)$/
+        );
         if (fullSummaryMatch) {
           fullSummary = fullSummaryMatch[1].trim();
         }
@@ -334,13 +362,13 @@ router.get(
           fullSummary,
           sourceUrl: summary.videoUrl,
           createdAt: summary.createdAt,
-        }
+        },
       });
     } catch (error) {
       console.error("Error fetching summary:", error);
-      res.status(500).json({ 
+      res.status(500).json({
         success: false,
-        error: "Failed to fetch summary" 
+        error: "Failed to fetch summary",
       });
     }
   }
@@ -363,9 +391,9 @@ router.delete(
       });
 
       if (!summary) {
-        res.status(404).json({ 
+        res.status(404).json({
           success: false,
-          error: "Summary not found" 
+          error: "Summary not found",
         });
         return;
       }
@@ -378,9 +406,9 @@ router.delete(
       res.json({ success: true });
     } catch (error) {
       console.error("Error deleting summary:", error);
-      res.status(500).json({ 
+      res.status(500).json({
         success: false,
-        error: "Failed to delete summary" 
+        error: "Failed to delete summary",
       });
     }
   }

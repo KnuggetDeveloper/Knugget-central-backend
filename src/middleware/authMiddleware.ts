@@ -10,13 +10,12 @@ const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!supabaseUrl || !supabaseServiceKey) {
-  console.error("Missing Supabase configuration. Please check environment variables.");
+  console.error(
+    "Missing Supabase configuration. Please check environment variables."
+  );
 }
 
-const supabase = createClient(
-  supabaseUrl || "",
-  supabaseServiceKey || ""
-);
+const supabase = createClient(supabaseUrl || "", supabaseServiceKey || "");
 
 export interface AuthRequest extends Request {
   user?: {
@@ -39,10 +38,12 @@ export const authMiddleware = async (
     return;
   }
 
+  // Inside export const authMiddleware = async (...) => {
+
   const token = authHeader.split(" ")[1];
 
   try {
-    // Validate with Supabase
+    // 1. Validate token via Supabase
     const {
       data: { user },
       error,
@@ -54,69 +55,58 @@ export const authMiddleware = async (
       return;
     }
 
-    try {
-      // Check if user exists in local database
-      let dbUser = await prisma.user.findUnique({
-        where: { id: user.id },
-      });
+    // 2. Try to find or create user in your DB
+    let dbUser = await prisma.user.findUnique({
+      where: { id: user.id },
+    });
 
-      // Create or update user in local DB
-      if (!dbUser) {
-        try {
-          // Create new user
-          dbUser = await prisma.user.create({
-            data: {
-              id: user.id,
-              email: user.email!,
-              name: user.user_metadata.full_name || "New User",
-              imageUrl: user.user_metadata.avatar_url || undefined,
-              provider: user.user_metadata.provider || "supabase",
-              credits: 10, // Initial free credits
-            },
-          });
-        } catch (createError) {
-          console.error("Failed to create user in database:", createError);
-          // Continue with Supabase user data
-        }
-      } else {
-        try {
-          // Update existing user
-          dbUser = await prisma.user.update({
-            where: { id: user.id },
-            data: {
-              email: user.email!,
-              name: user.user_metadata.full_name || dbUser.name,
-              imageUrl: user.user_metadata.avatar_url || dbUser.imageUrl,
-              provider: user.user_metadata.provider || dbUser.provider || "supabase",
-            },
-          });
-        } catch (updateError) {
-          console.error("Failed to update user in database:", updateError);
-          // Continue with existing dbUser data
-        }
+    if (!dbUser) {
+      try {
+        dbUser = await prisma.user.create({
+          data: {
+            id: user.id,
+            email: user.email!,
+            name: user.user_metadata.full_name || "New User",
+            imageUrl: user.user_metadata.avatar_url || undefined,
+            provider: user.user_metadata.provider || "supabase",
+            credits: 10,
+          },
+        });
+      } catch (createError) {
+        console.error("Failed to create user in database:", createError);
       }
-
-      req.user = {
-        id: user.id,
-        email: user.email!,
-        name: user.user_metadata.full_name || (dbUser?.name || ""),
-        image: user.user_metadata.avatar_url || (dbUser?.imageUrl || ""),
-      };
-
-      return next();
-    } catch (dbError) {
-      console.error("Database error in auth middleware:", dbError);
-
-      // In case of database error, still authenticate with Supabase data only
-      req.user = {
-        id: user.id,
-        email: user.email!,
-        name: user.user_metadata.full_name || "",
-        image: user.user_metadata.avatar_url || "",
-      };
-
-      return next();
+    } else {
+      try {
+        dbUser = await prisma.user.update({
+          where: { id: user.id },
+          data: {
+            email: user.email!,
+            name: user.user_metadata.full_name || dbUser.name,
+            imageUrl: user.user_metadata.avatar_url || dbUser.imageUrl,
+            provider:
+              user.user_metadata.provider || dbUser.provider || "supabase",
+          },
+        });
+      } catch (updateError) {
+        console.error("Failed to update user in database:", updateError);
+      }
     }
+
+    // 🔴 ✅ ADD THIS CHECK RIGHT HERE
+    if (!user && !dbUser) {
+      res.status(401).json({ error: "Failed to identify user" });
+      return;
+    }
+
+    // 3. Attach user data to req
+    req.user = {
+      id: user.id,
+      email: user.email!,
+      name: user.user_metadata.full_name || dbUser?.name || "",
+      image: user.user_metadata.avatar_url || dbUser?.imageUrl || "",
+    };
+
+    return next();
   } catch (err) {
     console.error("Auth Middleware Error:", err);
     res.status(500).json({ error: "Authentication middleware failed" });

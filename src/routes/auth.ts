@@ -10,7 +10,9 @@ const supabaseUrl = process.env.SUPABASE_URL || "";
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
 if (!supabaseUrl || !supabaseServiceKey) {
-  console.error("Missing Supabase configuration. Please check environment variables.");
+  console.error(
+    "Missing Supabase configuration. Please check environment variables."
+  );
 }
 
 const supabase = createClient(supabaseUrl, supabaseServiceKey);
@@ -166,49 +168,49 @@ router.post("/signup", async (req, res) => {
     }
 
     try {
-      // Create user in our database
-      const dbUser = await prisma.user.create({
+      console.log("Creating DB user:", {
+        id: data.user.id,
+        email: data.user.email,
+        name: name,
+        metadata: data.user.user_metadata,
+      });
+      // Create local DB user
+      const user = await prisma.user.create({
         data: {
           id: data.user.id,
-          name,
-          email,
-          provider: "supabase",
-          credits: 5, // Give new users 5 free credits
-        },
-      });
-
-      // Return user info with Supabase token
-      res.status(201).json({
-        token: data.session.access_token,
-        expiresAt: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
-        user: {
-          id: dbUser.id,
-          name: dbUser.name,
-          email: dbUser.email,
-          credits: dbUser.credits,
-          imageUrl: dbUser.imageUrl,
-          createdAt: dbUser.createdAt,
-        },
-      });
-    } catch (dbError) {
-      console.error("Database error during signup:", dbError);
-
-      // Still return auth token even if database operations fail
-      res.status(201).json({
-        token: data.session.access_token,
-        expiresAt: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
-        user: {
-          id: data.user.id,
+          email: data.user.email || email, // fallback to req.body.email
           name: name,
-          email: email,
-          credits: 5,
-          imageUrl: data.user.user_metadata.avatar_url || "",
+          imageUrl: data.user.user_metadata?.avatar_url || null,
+          provider: "supabase",
+          credits: 10,
         },
       });
+
+      // Respond with combined info
+      return res.json({
+        success: true,
+        data: {
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          token: data.session.access_token,
+          expiresAt: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
+          plan: "free",
+          createdAt: user.createdAt,
+        },
+      });
+    } catch (dbError: any) {
+      console.error("DB error:", dbError);
+      return res
+        .status(400)
+        .json({
+          error: "Failed to create user in database",
+          detail: dbError.message,
+        });
     }
   } catch (error) {
-    console.error("Registration error:", error);
-    res.status(500).json({ error: "Server error" });
+    console.error("Error during signup:", error);
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
