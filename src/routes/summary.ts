@@ -1,5 +1,5 @@
 // src/routes/summary.ts
-import { Router, Response, Request } from "express";
+import { Router, Response } from "express";
 import { authMiddleware, AuthRequest } from "../middleware/authMiddleware";
 import prisma from "../config/prismaClient";
 import { generateSummary } from "../services/generateSummary";
@@ -24,13 +24,14 @@ router.post(
       if (!content) {
         return res
           .status(400)
-          .json({ error: "Content (transcript) is required" });
+          .json({ success: false, error: "Content (transcript) is required" });
       }
 
       if (!metadata || !metadata.videoId) {
-        return res
-          .status(400)
-          .json({ error: "Video metadata with videoId is required" });
+        return res.status(400).json({
+          success: false,
+          error: "Video metadata with videoId is required",
+        });
       }
 
       const videoUrl =
@@ -84,6 +85,9 @@ router.post(
               title,
               keyPoints,
               fullSummary,
+              sourceUrl: existingSummary.videoUrl,
+              id: existingSummary.id,
+              createdAt: existingSummary.createdAt,
             },
           });
         }
@@ -92,8 +96,9 @@ router.post(
         // Continue with summary generation even if DB lookup fails
       }
 
-      // Check user credits
-      let userCredits = 0;
+      // This credit check is now handled by the requireCredits middleware,
+      // but we still need to get the current credit count to return it
+      let userCredits;
       try {
         const user = await prisma.user.findUnique({
           where: { id: userId },
@@ -108,16 +113,9 @@ router.post(
         }
 
         userCredits = user.credits;
-
-        if (userCredits < 1) {
-          return res.status(403).json({
-            success: false,
-            error: "Insufficient credits",
-          });
-        }
       } catch (dbError) {
-        console.error("Database error checking user credits:", dbError);
-        // For now, we'll allow the operation to continue even if credit check fails
+        console.error("Database error getting user credits:", dbError);
+        userCredits = 0; // Fallback value if we can't get the real count
       }
 
       // Generate summary
@@ -136,23 +134,32 @@ router.post(
         .join("\n")}\n\n${summary.fullSummary}`;
 
       // Save summary to database and update user credits
+      let newSummary;
       try {
-        await prisma.$transaction([
-          prisma.summary.create({
+        // Use a transaction for atomicity
+        const result = await prisma.$transaction(async (tx) => {
+          // Create the summary
+          const createdSummary = await tx.summary.create({
             data: {
               userId,
               videoUrl,
               summary: summaryText,
               transcript: content,
             },
-          }),
-          prisma.user.update({
+          });
+
+          // Decrement user credits
+          await tx.user.update({
             where: { id: userId },
             data: {
               credits: { decrement: 1 },
             },
-          }),
-        ]);
+          });
+
+          return createdSummary;
+        });
+
+        newSummary = result;
       } catch (dbError) {
         console.error("Database error saving summary:", dbError);
         // Continue and return the summary even if saving fails
@@ -160,7 +167,12 @@ router.post(
 
       return res.json({
         success: true,
-        data: summary,
+        data: {
+          ...summary,
+          id: newSummary?.id,
+          sourceUrl: videoUrl,
+          createdAt: newSummary?.createdAt,
+        },
         creditsRemaining: Math.max(0, userCredits - 1),
       });
     } catch (error) {
@@ -168,11 +180,13 @@ router.post(
       res.status(500).json({
         success: false,
         error: "Failed to generate summary",
+        message: error instanceof Error ? error.message : "Unknown error",
       });
     }
   }
 );
 
+// Rest of the methods remain the same but with improved error responses
 // Get all summaries for a user
 router.get("/", authMiddleware, async (req: AuthRequest, res) => {
   try {
@@ -246,6 +260,7 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
     res.status(500).json({
       success: false,
       error: "Failed to fetch summaries",
+      message: error instanceof Error ? error.message : "Unknown error",
       data: {
         summaries: [],
         total: 0,
@@ -291,13 +306,17 @@ router.post(
 
       res.json({
         success: true,
-        data: { id: newSummary.id },
+        data: {
+          id: newSummary.id,
+          createdAt: newSummary.createdAt,
+        },
       });
     } catch (error) {
       console.error("Error saving summary:", error);
       res.status(500).json({
         success: false,
         error: "Failed to create summary",
+        message: error instanceof Error ? error.message : "Unknown error",
       });
     }
   }
@@ -369,6 +388,7 @@ router.get(
       res.status(500).json({
         success: false,
         error: "Failed to fetch summary",
+        message: error instanceof Error ? error.message : "Unknown error",
       });
     }
   }
@@ -403,12 +423,16 @@ router.delete(
         where: { id },
       });
 
-      res.json({ success: true });
+      res.json({
+        success: true,
+        data: { id },
+      });
     } catch (error) {
       console.error("Error deleting summary:", error);
       res.status(500).json({
         success: false,
         error: "Failed to delete summary",
+        message: error instanceof Error ? error.message : "Unknown error",
       });
     }
   }

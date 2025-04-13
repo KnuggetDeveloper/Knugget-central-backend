@@ -1,216 +1,218 @@
 import { Router } from "express";
-import { authMiddleware, AuthRequest } from "../middleware/authMiddleware";
+import {
+  hashPassword,
+  comparePasswords,
+  generateTokens,
+  generateVerificationToken,
+  verifyToken,
+} from "../utils/auth";
 import prisma from "../config/prismaClient";
-import { createClient } from "@supabase/supabase-js";
 
 const router = Router();
 
-// Create Supabase client
-const supabaseUrl = process.env.SUPABASE_URL || "";
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-
-if (!supabaseUrl || !supabaseServiceKey) {
-  console.error(
-    "Missing Supabase configuration. Please check environment variables."
-  );
-}
-
-const supabase = createClient(supabaseUrl, supabaseServiceKey);
-
-// Get user profile
-router.get("/me", authMiddleware, async (req: AuthRequest, res) => {
-  const userId = req.user!.id;
-
+//get user data
+router.get("/me", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const token = authHeader.split(" ")[1];
   try {
+    const decoded = verifyToken(token);
+    if (!decoded) {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+    const userId = decoded.userId;
     const userData = await prisma.user.findUnique({
-      where: { id: userId },
+      where: {
+        id: userId,
+      },
       select: {
         id: true,
-        name: true,
         email: true,
-        credits: true,
+        name: true,
         imageUrl: true,
+        credits: true,
         createdAt: true,
       },
     });
-
     if (!userData) {
       return res.status(404).json({ error: "User not found" });
     }
-
-    res.json({ user: userData });
+    res.json(userData);
   } catch (error) {
-    console.error("Error fetching user profile:", error);
-
-    // Return basic user info even if database fails
-    if (req.user) {
-      return res.json({
-        user: {
-          id: req.user.id,
-          name: req.user.name,
-          email: req.user.email,
-          credits: 0,
-          imageUrl: req.user.image,
-        },
-      });
-    }
-
-    res.status(500).json({ error: "Server error" });
+    console.error("Error fetching user data:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// Login user with Supabase - route changed to /signin for consistency
+//signup
 router.post("/signin", async (req, res) => {
   try {
     const { email, password } = req.body;
-
     if (!email || !password) {
-      return res.status(400).json({ error: "Email and password are required" });
+      return res.status(400).json({ error: "Missing required fields" });
     }
-
-    // Use Supabase authentication
-    const { data, error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
+    // Find user by email
+    const user = await prisma.user.findUnique({
+      where: { email },
     });
-
-    if (error) {
-      return res.status(401).json({ error: error.message });
+    if (!user || !user.passwordHash) {
+      return res.status(400).json({ error: "User not found" });
+    }
+    // compare passwords
+    const isPasswordValid = await comparePasswords(password, user.passwordHash);
+    if (!isPasswordValid) {
+      return res.status(401).json({ error: "Invalid password" });
     }
 
-    if (!data || !data.user || !data.session) {
-      return res.status(401).json({ error: "Invalid credentials" });
-    }
+    // generate tokens
+    const { accessToken, refreshToken, expiresAt } = generateTokens(
+      user.id,
+      user.email
+    );
 
-    try {
-      // Get or create user in our database
-      let dbUser = await prisma.user.findUnique({
-        where: { id: data.user.id },
-      });
-
-      if (!dbUser) {
-        // Create new user
-        dbUser = await prisma.user.create({
-          data: {
-            id: data.user.id,
-            email: data.user.email!,
-            name: data.user.user_metadata.full_name || "New User",
-            imageUrl: data.user.user_metadata.avatar_url || undefined,
-            provider: "supabase",
-            credits: 5, // Initial free credits
-          },
-        });
-      }
-
-      // Return user info with Supabase token
-      res.json({
-        token: data.session.access_token,
-        expiresAt: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
-        user: {
-          id: dbUser.id,
-          name: dbUser.name,
-          email: dbUser.email,
-          credits: dbUser.credits,
-          imageUrl: dbUser.imageUrl,
-          createdAt: dbUser.createdAt,
-        },
-      });
-    } catch (dbError) {
-      console.error("Database error during login:", dbError);
-
-      // Still return auth token even if database operations fail
-      res.json({
-        token: data.session.access_token,
-        expiresAt: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
-        user: {
-          id: data.user.id,
-          name: data.user.user_metadata.full_name || "",
-          email: data.user.email!,
-          credits: 0,
-          imageUrl: data.user.user_metadata.avatar_url || "",
-        },
-      });
-    }
+    // update user with refresh token
+    await prisma.user.update({
+      where: {
+        id: user.id,
+      },
+      data: {
+        refreshToken,
+        lastLogin: new Date(),
+      },
+    });
+    // send response
+    res.json({
+      token: accessToken,
+      expiresAt,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        credits: user.credits,
+        imageUrl: user.imageUrl,
+        createdAt: user.createdAt,
+      },
+    });
   } catch (error) {
-    console.error("Login error:", error);
-    res.status(500).json({ error: "Server error" });
+    console.error("Error signing in:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// Register user with Supabase - route changed to /signup for consistency
+// signup
 router.post("/signup", async (req, res) => {
   try {
-    const { name, email, password } = req.body;
-
-    if (!name || !email || !password) {
-      return res
-        .status(400)
-        .json({ error: "Name, email, and password are required" });
+    const { email, password, name } = req.body;
+    if (!email || !password || !name) {
+      return res.status(400).json({ error: "Missing required fields" });
     }
+    // check if user already exists
+    const existingUser = await prisma.user.findUnique({
+      where: { email },
+    });
+    if (existingUser) {
+      return res.status(400).json({ error: "User already exists" });
+    }
+    // hash password
+    const hashedPassword = await hashPassword(password);
 
-    // Use Supabase to create a new user
-    const { data, error } = await supabase.auth.signUp({
-      email,
-      password,
-      options: {
-        data: {
-          full_name: name,
-        },
+    //generate verification token
+    const verificationToken = generateVerificationToken();
+
+    //create user
+    const user = await prisma.user.create({
+      data: {
+        email,
+        name,
+        passwordHash: hashedPassword,
+        verificationToken,
+        credits: 10, // Initial free credits
       },
     });
+    // generate tokens
+    const { accessToken, refreshToken, expiresAt } = generateTokens(
+      user.id,
+      user.email
+    );
 
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
+    // Update user with refresh token
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        refreshToken,
+        lastLogin: new Date(),
+      },
+    });
+    // TODO: Send verification email (implement this based on your email provider)
+    // sendVerificationEmail(user.email, verificationToken);
 
-    if (!data || !data.user || !data.session) {
-      return res.status(400).json({ error: "Failed to create user" });
-    }
-
-    try {
-      console.log("Creating DB user:", {
-        id: data.user.id,
-        email: data.user.email,
-        name: name,
-        metadata: data.user.user_metadata,
-      });
-      // Create local DB user
-      const user = await prisma.user.create({
-        data: {
-          id: data.user.id,
-          email: data.user.email || email, // fallback to req.body.email
-          name: name,
-          imageUrl: data.user.user_metadata?.avatar_url || null,
-          provider: "supabase",
-          credits: 10,
-        },
-      });
-
-      // Respond with combined info
-      return res.json({
-        success: true,
-        data: {
-          id: user.id,
-          email: user.email,
-          name: user.name,
-          token: data.session.access_token,
-          expiresAt: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
-          plan: "free",
-          createdAt: user.createdAt,
-        },
-      });
-    } catch (dbError: any) {
-      console.error("DB error:", dbError);
-      return res
-        .status(400)
-        .json({
-          error: "Failed to create user in database",
-          detail: dbError.message,
-        });
-    }
+    // send response
+    res.json({
+      token: accessToken,
+      expiresAt,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        credits: user.credits,
+        imageUrl: user.imageUrl,
+        createdAt: user.createdAt,
+      },
+    });
   } catch (error) {
     console.error("Error during signup:", error);
     return res.status(500).json({ error: "Server error" });
+  }
+});
+
+// refresh token
+router.post("/refresh", async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+
+    if (!refreshToken) {
+      return res.status(400).json({ error: "Refresh token is required" });
+    }
+
+    // Find user by refresh token
+    const user = await prisma.user.findFirst({
+      where: { refreshToken },
+    });
+
+    if (!user) {
+      return res.status(401).json({ error: "Invalid refresh token" });
+    }
+
+    // Generate new tokens
+    const {
+      accessToken,
+      refreshToken: newRefreshToken,
+      expiresAt,
+    } = generateTokens(user.id, user.email);
+
+    // Update user with new refresh token
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { refreshToken: newRefreshToken },
+    });
+
+    res.json({
+      token: accessToken,
+      refreshToken: newRefreshToken,
+      expiresAt,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        credits: user.credits,
+        imageUrl: user.imageUrl,
+      },
+    });
+  } catch (error) {
+    console.error("Token refresh error:", error);
+    res.status(500).json({ error: "Server error" });
   }
 });
 

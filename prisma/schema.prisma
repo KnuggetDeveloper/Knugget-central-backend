@@ -14,19 +14,23 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
+// Update prisma/schema.prisma
+
 model User {
   id                String    @id @default(uuid())
   email             String    @unique
   name              String?
-  passwordHash      String?
+  passwordHash      String // This field already exists in your schema
   imageUrl          String?
   credits           Int       @default(0)
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
   summaries         Summary[]
-  provider          String?
   emailVerified     Boolean   @default(false)
   verificationToken String?
+  // New fields for custom auth
+  refreshToken      String? // For token refresh functionality
+  lastLogin         DateTime?
 }
 
 model Summary {

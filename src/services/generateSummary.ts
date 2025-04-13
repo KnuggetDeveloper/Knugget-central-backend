@@ -40,33 +40,38 @@ export const generateSummary = async (
 }> => {
   // Get title from metadata or use a default
   const title = metadata?.title || "Video Summary";
-  
+
   try {
     // Extract sentences from transcript
-    const sentences = transcript.split(/[.!?]+/).filter(s => s.trim().length > 20);
-    
+    const sentences = transcript
+      .split(/[.!?]+/)
+      .filter((s) => s.trim().length > 20);
+
     // Select a few key sentences as key points
     const keyPoints = sentences
       .slice(0, Math.min(5, sentences.length))
-      .map(s => s.trim())
+      .map((s) => s.trim())
       .filter((s, i, arr) => arr.indexOf(s) === i); // Remove duplicates
 
     // Create a simple summary paragraph
-    const summary = `This video discusses ${keyPoints.join(". It also covers ")}`;
-    
+    const summary = `This video discusses ${keyPoints.join(
+      ". It also covers "
+    )}`;
+
     return {
       title,
-      keyPoints: keyPoints.length > 0 ? keyPoints : ["No key points extracted"],
-      fullSummary: summary || "Summary generation failed. Please try again."
+      keyPoints: keyPoints.length > 0 ? keyPoints : [],
+      fullSummary: summary || "Summary generation failed. Please try again.",
     };
   } catch (error) {
     console.error("Error generating summary:", error);
-    
+
     // Return a graceful failure
     return {
       title,
-      keyPoints: ["Summary generation failed"],
-      fullSummary: "Sorry, we couldn't generate a summary for this video at this time."
+      keyPoints: [], // Empty array instead of null or undefined
+      fullSummary:
+        "Sorry, we couldn't generate a summary for this video at this time.",
     };
   }
 };
