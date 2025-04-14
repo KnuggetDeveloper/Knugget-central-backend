@@ -34,22 +34,22 @@ router.post(
         });
       }
 
-      // Ensure we're using the correct URL format for lookup and storage
-      const videoUrl = metadata.url || `https://www.youtube.com/watch?v=${metadata.videoId}`;
+      const videoUrl =
+        metadata.url || `https://www.youtube.com/watch?v=${metadata.videoId}`;
       console.log(`Generating summary for video: ${videoUrl}`);
 
-      // Check for existing summary for THIS SPECIFIC video URL
+      // Check for existing summary (but don't save a new one yet)
       let existingSummary;
       try {
         existingSummary = await prisma.summary.findFirst({
           where: {
-            videoUrl: videoUrl, // Make sure we're using the exact video URL
-            userId: userId     // Also make sure it belongs to the same user
+            videoUrl: videoUrl,
+            userId: userId,
           },
         });
 
         console.log(`Existing summary found: ${!!existingSummary}`);
-        
+
         if (existingSummary) {
           // Parse the stored summary into the expected format
           let keyPoints: string[] = [];
@@ -92,12 +92,12 @@ router.post(
               sourceUrl: existingSummary.videoUrl,
               id: existingSummary.id,
               createdAt: existingSummary.createdAt,
+              alreadySaved: true, // Indicate this summary is already saved
             },
           });
         }
       } catch (dbError) {
         console.error("Database error checking for existing summary:", dbError);
-        // Continue with summary generation even if DB lookup fails
       }
 
       // Get user credits
@@ -116,13 +116,26 @@ router.post(
         }
 
         userCredits = user.credits;
+
+        // Check if user has enough credits
+        if (userCredits <= 0) {
+          return res.status(403).json({
+            success: false,
+            error: "Not enough credits to generate summary",
+          });
+        }
       } catch (dbError) {
         console.error("Database error getting user credits:", dbError);
-        userCredits = 0; // Fallback value if we can't get the real count
+        return res.status(500).json({
+          success: false,
+          error: "Failed to check user credits",
+        });
       }
 
-      // Generate a new summary - this is where we need to make sure we're using the current video content
-      console.log(`Generating new summary for content length: ${content.length}`);
+      // Generate a new summary
+      console.log(
+        `Generating new summary for content length: ${content.length}`
+      );
       const summary = await generateSummary(content, metadata);
 
       if (!summary.fullSummary) {
@@ -132,51 +145,26 @@ router.post(
         });
       }
 
-      // Format summary for storage
-      const summaryText = `${summary.title}\n\nKey Points:\n${summary.keyPoints
-        .map((point) => `- ${point}`)
-        .join("\n")}\n\n${summary.fullSummary}`;
-
-      // Save the new summary to database and update user credits
-      let newSummary;
+      // Decrement user credits for generating summary
       try {
-        // Use a transaction for atomicity
-        const result = await prisma.$transaction(async (tx) => {
-          // Create the summary with the current video URL and transcript
-          const createdSummary = await tx.summary.create({
-            data: {
-              userId,
-              videoUrl: videoUrl, // Make sure we're storing the correct URL
-              summary: summaryText,
-              transcript: content, // Store the current transcript
-            },
-          });
-
-          // Decrement user credits
-          await tx.user.update({
-            where: { id: userId },
-            data: {
-              credits: { decrement: 1 },
-            },
-          });
-
-          return createdSummary;
+        await prisma.user.update({
+          where: { id: userId },
+          data: {
+            credits: { decrement: 1 },
+          },
         });
-
-        newSummary = result;
-        console.log(`New summary created with ID: ${newSummary.id}`);
       } catch (dbError) {
-        console.error("Database error saving summary:", dbError);
-        // Continue and return the summary even if saving fails
+        console.error("Error updating user credits:", dbError);
+        // Continue anyway to return the summary
       }
 
+      // Return the generated summary without saving it to database yet
       return res.json({
         success: true,
         data: {
           ...summary,
-          id: newSummary?.id,
           sourceUrl: videoUrl,
-          createdAt: newSummary?.createdAt,
+          alreadySaved: false, // Indicate this summary is not yet saved
         },
         creditsRemaining: Math.max(0, userCredits - 1),
       });
@@ -190,7 +178,87 @@ router.post(
     }
   }
 );
-// Rest of the methods remain the same but with improved error responses
+
+// Save summary route - protected by auth
+// Enhanced save summary route - more robust with content validation
+router.post(
+  "/save",
+  authMiddleware,
+  async (req: AuthRequest, res: Response) => {
+    const userId = req.user!.id;
+    const { videoId, title, keyPoints, fullSummary, sourceUrl, transcript } =
+      req.body;
+
+    if (!videoId || !title || !fullSummary) {
+      res.status(400).json({
+        success: false,
+        error: "Missing required fields",
+      });
+      return;
+    }
+
+    try {
+      const videoUrl =
+        sourceUrl || `https://www.youtube.com/watch?v=${videoId}`;
+
+      // Check if this summary already exists
+      const existingSummary = await prisma.summary.findFirst({
+        where: {
+          videoUrl,
+          userId,
+        },
+      });
+
+      if (existingSummary) {
+        // Summary already exists, return it
+        return res.json({
+          success: true,
+          data: {
+            id: existingSummary.id,
+            createdAt: existingSummary.createdAt,
+            alreadySaved: true,
+          },
+          message: "Summary already saved",
+        });
+      }
+
+      // Format the summary for storage
+      const summaryText = `${title}\n\nKey Points:\n${keyPoints
+        .map((point: string) => `- ${point}`)
+        .join("\n")}\n\n${fullSummary}`;
+
+      // Create the new summary
+      const newSummary = await prisma.summary.create({
+        data: {
+          userId,
+          videoUrl,
+          summary: summaryText,
+          transcript: transcript || "", // Store transcript if provided
+        },
+      });
+
+      console.log(`Summary saved with ID: ${newSummary.id}`);
+
+      res.json({
+        success: true,
+        data: {
+          id: newSummary.id,
+          createdAt: newSummary.createdAt,
+          alreadySaved: true,
+        },
+        message: "Summary saved successfully",
+      });
+    } catch (error) {
+      console.error("Error saving summary:", error);
+      res.status(500).json({
+        success: false,
+        error: "Failed to save summary",
+        message: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  }
+);
+
 // Get all summaries for a user
 router.get("/", authMiddleware, async (req: AuthRequest, res) => {
   try {
@@ -274,57 +342,6 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
     });
   }
 });
-
-// Save summary route - protected by auth
-router.post(
-  "/save",
-  authMiddleware,
-  async (req: AuthRequest, res: Response): Promise<void> => {
-    const { videoId, title, keyPoints, fullSummary, sourceUrl } = req.body;
-
-    if (!videoId || !title || !fullSummary) {
-      res.status(400).json({
-        success: false,
-        error: "Missing required fields",
-      });
-      return;
-    }
-
-    try {
-      const videoUrl =
-        sourceUrl || `https://www.youtube.com/watch?v=${videoId}`;
-
-      // Format the summary for storage
-      const summaryText = `${title}\n\nKey Points:\n${keyPoints
-        .map((point: string) => `- ${point}`)
-        .join("\n")}\n\n${fullSummary}`;
-
-      const newSummary = await prisma.summary.create({
-        data: {
-          userId: req.user!.id,
-          videoUrl,
-          summary: summaryText,
-          transcript: "", // Empty or placeholder
-        },
-      });
-
-      res.json({
-        success: true,
-        data: {
-          id: newSummary.id,
-          createdAt: newSummary.createdAt,
-        },
-      });
-    } catch (error) {
-      console.error("Error saving summary:", error);
-      res.status(500).json({
-        success: false,
-        error: "Failed to create summary",
-        message: error instanceof Error ? error.message : "Unknown error",
-      });
-    }
-  }
-);
 
 // Get single summary route - protected by auth
 router.get(
