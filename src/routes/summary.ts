@@ -34,18 +34,22 @@ router.post(
         });
       }
 
-      const videoUrl =
-        metadata.url || `https://www.youtube.com/watch?v=${metadata.videoId}`;
+      // Ensure we're using the correct URL format for lookup and storage
+      const videoUrl = metadata.url || `https://www.youtube.com/watch?v=${metadata.videoId}`;
+      console.log(`Generating summary for video: ${videoUrl}`);
 
-      // Check for existing summary
+      // Check for existing summary for THIS SPECIFIC video URL
       let existingSummary;
       try {
         existingSummary = await prisma.summary.findFirst({
           where: {
-            videoUrl,
+            videoUrl: videoUrl, // Make sure we're using the exact video URL
+            userId: userId     // Also make sure it belongs to the same user
           },
         });
 
+        console.log(`Existing summary found: ${!!existingSummary}`);
+        
         if (existingSummary) {
           // Parse the stored summary into the expected format
           let keyPoints: string[] = [];
@@ -96,8 +100,7 @@ router.post(
         // Continue with summary generation even if DB lookup fails
       }
 
-      // This credit check is now handled by the requireCredits middleware,
-      // but we still need to get the current credit count to return it
+      // Get user credits
       let userCredits;
       try {
         const user = await prisma.user.findUnique({
@@ -118,7 +121,8 @@ router.post(
         userCredits = 0; // Fallback value if we can't get the real count
       }
 
-      // Generate summary
+      // Generate a new summary - this is where we need to make sure we're using the current video content
+      console.log(`Generating new summary for content length: ${content.length}`);
       const summary = await generateSummary(content, metadata);
 
       if (!summary.fullSummary) {
@@ -133,18 +137,18 @@ router.post(
         .map((point) => `- ${point}`)
         .join("\n")}\n\n${summary.fullSummary}`;
 
-      // Save summary to database and update user credits
+      // Save the new summary to database and update user credits
       let newSummary;
       try {
         // Use a transaction for atomicity
         const result = await prisma.$transaction(async (tx) => {
-          // Create the summary
+          // Create the summary with the current video URL and transcript
           const createdSummary = await tx.summary.create({
             data: {
               userId,
-              videoUrl,
+              videoUrl: videoUrl, // Make sure we're storing the correct URL
               summary: summaryText,
-              transcript: content,
+              transcript: content, // Store the current transcript
             },
           });
 
@@ -160,6 +164,7 @@ router.post(
         });
 
         newSummary = result;
+        console.log(`New summary created with ID: ${newSummary.id}`);
       } catch (dbError) {
         console.error("Database error saving summary:", dbError);
         // Continue and return the summary even if saving fails
@@ -185,7 +190,6 @@ router.post(
     }
   }
 );
-
 // Rest of the methods remain the same but with improved error responses
 // Get all summaries for a user
 router.get("/", authMiddleware, async (req: AuthRequest, res) => {
