@@ -227,13 +227,15 @@ router.post(
         .map((point: string) => `- ${point}`)
         .join("\n")}\n\n${fullSummary}`;
 
-      // Create the new summary
+      // Create the new summary with all required fields
       const newSummary = await prisma.summary.create({
         data: {
           userId,
           videoUrl,
           summary: summaryText,
-          transcript: transcript || "", // Store transcript if provided
+          transcript: transcript || "",
+          title: title, // Add title field
+          videoId: videoId, // Add videoId field
         },
       });
 
@@ -273,6 +275,13 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
         orderBy: { createdAt: "desc" },
         skip,
         take: limit,
+        select: {
+          id: true,
+          videoUrl: true,
+          summary: true,
+          transcript: true,
+          createdAt: true,
+        },
       }),
       prisma.summary.count({
         where: { userId },
@@ -308,6 +317,17 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
         }
       }
 
+      // Extract YouTube video ID if it exists
+      let videoId = null;
+      if (summary.videoUrl) {
+        const match = summary.videoUrl.match(
+          /(?:youtube\.com\/watch\?v=|youtu\.be\/)([^&]+)/
+        );
+        if (match && match[1]) {
+          videoId = match[1];
+        }
+      }
+
       return {
         id: summary.id,
         title,
@@ -315,6 +335,8 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
         fullSummary,
         sourceUrl: summary.videoUrl,
         createdAt: summary.createdAt,
+        transcript: summary.transcript || "",
+        videoId,
       };
     });
 
@@ -356,6 +378,13 @@ router.get(
           id,
           userId: req.user!.id,
         },
+        select: {
+          id: true,
+          videoUrl: true,
+          summary: true,
+          transcript: true,
+          createdAt: true,
+        },
       });
 
       if (!summary) {
@@ -393,6 +422,17 @@ router.get(
         }
       }
 
+      // Extract YouTube video ID if it exists
+      let videoId = null;
+      if (summary.videoUrl) {
+        const match = summary.videoUrl.match(
+          /(?:youtube\.com\/watch\?v=|youtu\.be\/)([^&]+)/
+        );
+        if (match && match[1]) {
+          videoId = match[1];
+        }
+      }
+
       res.json({
         success: true,
         data: {
@@ -402,6 +442,8 @@ router.get(
           fullSummary,
           sourceUrl: summary.videoUrl,
           createdAt: summary.createdAt,
+          transcript: summary.transcript || "",
+          videoId,
         },
       });
     } catch (error) {
@@ -455,6 +497,96 @@ router.delete(
         error: "Failed to delete summary",
         message: error instanceof Error ? error.message : "Unknown error",
       });
+    }
+  }
+);
+
+// Get transcript for a summary
+router.get(
+  "/:id/transcript",
+  authMiddleware,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const summaryId = req.params.id;
+      console.log(`Getting transcript for summary ID: ${summaryId}`);
+
+      if (!req.user || !req.user.id) {
+        console.log("User not authenticated in transcript request");
+        return res.status(401).json({ error: "User not authenticated" });
+      }
+
+      // Get the summary with transcript
+      const summary = await prisma.summary.findUnique({
+        where: {
+          id: summaryId,
+          userId: req.user.id, // Make sure the summary belongs to the user
+        },
+        select: {
+          id: true,
+          summary: true,
+          transcript: true,
+          videoUrl: true,
+        },
+      });
+
+      if (!summary) {
+        console.log(`Summary not found for ID: ${summaryId}`);
+        return res.status(404).json({ error: "Summary not found" });
+      }
+
+      console.log(
+        `Found summary. Transcript length: ${
+          summary.transcript?.length || 0
+        } characters`
+      );
+
+      // Extract title from summary content if needed
+      let title = "";
+      const titleMatch = summary.summary?.match(/^(.*?)\n/);
+      if (titleMatch) {
+        title = titleMatch[1].trim();
+      }
+
+      // If no transcript is available, try to use a default one for demo purposes
+      let transcriptText = summary.transcript || "";
+      if (!transcriptText || transcriptText.trim() === "") {
+        console.log("No transcript found, using fallback demo transcript");
+
+        // Generate a default transcript based on the summary content
+        if (summary.summary) {
+          // Extract just the full summary part (not the key points)
+          const fullSummaryMatch = summary.summary.match(
+            /(?:Key Points:[\s\S]*?\n\n)([\s\S]*?)$/
+          );
+
+          if (fullSummaryMatch && fullSummaryMatch[1]) {
+            const fullSummary = fullSummaryMatch[1].trim();
+
+            // Create a demo transcript by repeating the summary content in a transcript style
+            transcriptText = `This is an auto-generated transcript for demo purposes:\n\n`;
+
+            // Split the summary into sentences and format as a transcript
+            const sentences = fullSummary.match(/[^.!?]+[.!?]+/g) || [];
+            sentences.forEach((sentence, i) => {
+              const time = (i * 30).toString().padStart(2, "0");
+              transcriptText += `[00:${time}:00] ${sentence.trim()}\n`;
+            });
+          }
+        }
+
+        if (!transcriptText) {
+          transcriptText = "No transcript is available for this video.";
+        }
+      }
+
+      return res.json({
+        success: true,
+        title: title, // Include the extracted title
+        transcript: transcriptText,
+      });
+    } catch (error) {
+      console.error("Error fetching transcript:", error);
+      return res.status(500).json({ error: "Failed to fetch transcript" });
     }
   }
 );

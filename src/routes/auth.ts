@@ -209,6 +209,7 @@ router.post("/refresh", async (req, res) => {
         credits: user.credits,
         imageUrl: user.imageUrl,
       },
+      success: true,
     });
   } catch (error) {
     console.error("Token refresh error:", error);

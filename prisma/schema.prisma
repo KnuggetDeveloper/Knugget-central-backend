@@ -36,6 +36,8 @@ model User {
 model Summary {
   id         String   @id @default(uuid())
   userId     String
+  title      String
+  videoId    String
   videoUrl   String
   transcript String
   summary    String
